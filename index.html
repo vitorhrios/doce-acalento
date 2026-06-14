@@ -518,7 +518,11 @@
     <!-- Container para Toasts -->
     <div id="toast-container" class="fixed top-24 md:top-20 left-1/2 transform -translate-x-1/2 z-[110] pointer-events-none flex flex-col gap-2 items-center"></div>
 
-    <script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
         const themeColors = {
             // TEMA EXTRAÍDO DA IMAGEM "DOCE ACALENTO"
             acalento: { 50: '#fcf6f5', 100: '#f6e8e4', 200: '#e9c4bb', 300: '#dfa396', 400: '#cf8271', 500: '#c27a6a', 600: '#a15b4c', 700: '#4a2b23' },
@@ -567,6 +571,101 @@
         let currentFlavorProductId = null;
 
         const formatCurrency = (value) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
+
+        // --- SISTEMA DE COMPRESSÃO DE IMAGEM ---
+        const compressImage = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = (event) => {
+                    const img = new Image();
+                    img.src = event.target.result;
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        const MAX_WIDTH = 800; 
+                        const MAX_HEIGHT = 800;
+                        let width = img.width;
+                        let height = img.height;
+
+                        if (width > height) {
+                            if (width > MAX_WIDTH) {
+                                height *= MAX_WIDTH / width;
+                                width = MAX_WIDTH;
+                            }
+                        } else {
+                            if (height > MAX_HEIGHT) {
+                                width *= MAX_HEIGHT / height;
+                                height = MAX_HEIGHT;
+                            }
+                        }
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        resolve(canvas.toDataURL('image/webp', 0.8)); // WebP para maior otimização
+                    };
+                };
+                reader.onerror = error => reject(error);
+            });
+        };
+
+        // --- BANCO DE DADOS (FIRESTORE) ---
+        let db, auth;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let isOnline = false;
+
+        if (typeof __firebase_config !== 'undefined') {
+            const firebaseConfig = JSON.parse(__firebase_config);
+            const app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+            isOnline = true;
+
+            const initAuth = async () => {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            };
+            initAuth();
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'storeData', 'main');
+                    onSnapshot(docRef, (docSnap) => {
+                        if (docSnap.exists()) {
+                            const data = docSnap.data();
+                            if(data.adminPassword) state.adminPassword = data.adminPassword;
+                            if(data.config) state.config = { ...state.config, ...data.config };
+                            if(data.products) state.products = data.products;
+                            
+                            applyThemeColor(state.config.themeColor);
+                            populateConfigForm();
+                            renderAdminProducts();
+                            renderStoreCategoriesUI();
+                            renderStoreProducts();
+                            updateStoreInfo();
+                        }
+                    }, (err) => console.error("Erro no listener Firestore:", err));
+                }
+            });
+        }
+
+        const saveStateToFirestore = async () => {
+            if (isOnline && auth && auth.currentUser) {
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'storeData', 'main');
+                    await setDoc(docRef, {
+                        adminPassword: state.adminPassword,
+                        config: state.config,
+                        products: state.products
+                    });
+                } catch (error) {
+                    console.error("Erro ao salvar no banco de dados:", error);
+                }
+            }
+        };
 
         const applyThemeColor = (colorKey) => {
             const colors = themeColors[colorKey] || themeColors.rosa;
@@ -664,10 +763,15 @@
         document.getElementById('tab-settings').addEventListener('click', () => { state.adminTab = 'settings'; updateNavigationUI(); });
 
         // --- UPLOAD ---
-        window.handleImageUpload = (event) => {
+        window.handleImageUpload = async (event) => {
             const files = event.target.files;
             if(files.length > 0) {
-                Array.from(files).forEach(file => { tempImagesUpload.push(URL.createObjectURL(file)); });
+                for(let file of files) {
+                    try {
+                        const compressedBase64 = await compressImage(file);
+                        tempImagesUpload.push(compressedBase64);
+                    } catch(e) { console.error("Erro ao processar imagem", e); }
+                }
                 renderImagePreview();
             }
             event.target.value = ''; 
@@ -687,11 +791,13 @@
         };
 
         // --- ADMIN: CONFIGURAÇÕES E UPLOAD DE LOGO/BANNER ---
-        window.handleConfigImageUpload = (event, type) => {
+        window.handleConfigImageUpload = async (event, type) => {
             const file = event.target.files[0];
             if (file) {
-                state.config[type] = URL.createObjectURL(file);
-                updateConfigImagePreview(type);
+                try {
+                    state.config[type] = await compressImage(file);
+                    updateConfigImagePreview(type);
+                } catch(e) { console.error("Erro ao processar imagem", e); }
             }
             event.target.value = '';
         };
@@ -737,7 +843,7 @@
 
         document.getElementById('config-phone').addEventListener('input', (e) => { e.target.value = e.target.value.replace(/\D/g, ''); });
 
-        document.getElementById('form-config').addEventListener('submit', (e) => {
+        document.getElementById('form-config').addEventListener('submit', async (e) => {
             e.preventDefault();
             const oldPass = document.getElementById('config-old-pass').value;
             const newPass = document.getElementById('config-new-pass').value;
@@ -764,6 +870,8 @@
             applyThemeColor(state.config.themeColor);
             populateCategorySelects();
             updateStoreInfo();
+            
+            await saveStateToFirestore();
             
             const btn = document.getElementById('btn-save-config');
             const originalText = btn.innerHTML;
@@ -888,7 +996,7 @@
             document.getElementById('btn-cancel-prod').classList.add('hidden');
         };
 
-        document.getElementById('form-product').addEventListener('submit', (e) => {
+        document.getElementById('form-product').addEventListener('submit', async (e) => {
             e.preventDefault();
             const name = document.getElementById('prod-name').value;
             const price = parseFloat(document.getElementById('prod-price').value);
@@ -930,6 +1038,7 @@
             
             resetProductForm();
             renderAdminProducts();
+            await saveStateToFirestore();
         });
 
         document.getElementById('btn-cancel-prod').addEventListener('click', resetProductForm);
@@ -965,8 +1074,8 @@
             window.scrollTo({ top: 0, behavior: 'smooth' });
         };
 
-        window.deleteProduct = (id) => { state.products = state.products.filter(p => p.id !== id); renderAdminProducts(); showToast('Produto removido.', 'success'); };
-        window.duplicateProduct = (id) => {
+        window.deleteProduct = async (id) => { state.products = state.products.filter(p => p.id !== id); renderAdminProducts(); showToast('Produto removido.', 'success'); await saveStateToFirestore(); };
+        window.duplicateProduct = async (id) => {
             const product = state.products.find(p => p.id === id);
             if (!product) return;
             const clonedProduct = JSON.parse(JSON.stringify(product));
@@ -974,6 +1083,7 @@
             clonedProduct.name = clonedProduct.name + ' (Cópia)';
             state.products.push(clonedProduct);
             renderAdminProducts(); showToast('Produto duplicado com sucesso!');
+            await saveStateToFirestore();
         };
 
         // --- STOREFRONT DA LOJA ---
